@@ -52,7 +52,6 @@ int lockedFireMode;
 int previousFireMode = LOW;
 unsigned long timeFireMode = 0;
 const char* fireModeName[] = {"SAFE","SEMI","BURST","AUTO"};
-int fireModeCurrent = 0;
 
 // Burst functionality, count and number of times to fire remaining
 int burstCount = 3;
@@ -134,10 +133,403 @@ void initPins();
 void initDisplay();
 void initBattery();
 
+// Begin Suild code
+// variables for managing all of firing state
+#define ON true
+#define OFF false
+
+// Macros for pusher drive state
+#define PUSHER_MOTOR_FIRING_MECHANISM 0
+#define SOLENOID_FIRING_MECHANISM 1
+
+#define PUSHER_DRIVE_STATE_OFF 0
+#define PUSHER_DRIVE_STATE_BRAKE 1
+#define PUSHER_DRIVE_STATE_ON 2
+
+// Feed state. READY means one in the chamber, NEEDED meand empty chamber, ON means the solenoid is currently firing.
+#define FEED_STATE_READY 0
+#define FEED_STATE_NEEDED 1
+#define FEED_STATE_ON 2
+
+// Macros for rate of fire. Make sure FULL_AUTO is always last!
+#define SAFETY 0
+#define SEMI_AUTO 1
+#define BURST_FIRE 2
+#define FULL_AUTO 3
+
+#define BURST_FIRE_LENGTH 3
+
+struct firingState {
+	uint8_t currentPusherState = PUSHER_DRIVE_STATE_OFF;
+	// should only be mutated in controlMotors(), but can be accessed anywhere
+	uint8_t targetPusherState = PUSHER_DRIVE_STATE_OFF;
+  bool changingPusherState = false;
+	// Keep track if pusher is firing. I can't just check if the pusher is being
+	// powered because sometimes, the pusher is firing but off (for example, a
+	// solenoid returning to its retracted position)
+  bool isPusherFiring = false;
+
+	uint8_t currentFeedState = FEED_STATE_NEEDED;
+	uint8_t targetFeedState = FEED_STATE_READY;
+  bool changingFeedState = false;
+	bool isFeedFiring = false;
+
+	// Keep track of firing mechanism, solenoid or pusher. This is updated on
+	// trigger pull by reading the jumper
+	bool pusherMechanism = SOLENOID_FIRING_MECHANISM;
+
+	uint8_t currentFireMode = FULL_AUTO;
+
+
+	// Keeps track of how many darts to fire in semi- and burst-fire modes
+	uint8_t dartsToFire = 0;
+
+	// Keep track of how many darts have been fired
+	uint8_t dartsFired = 0;
+
+	// Rate of fire from 0 to 100 (100 fastest)
+	uint8_t rateOfFire = 100;
+
+	// Off time between shots when in pusher motor mode. Higher rate of fire means
+	// higher off time between shots. Units in ms
+	uint8_t pusherMotorOffTime = 0;
+
+	// Duty cyle for solenoid firing. Different fire rates will be a factor of
+	// this. Units are percent
+	const uint8_t SOLENOID_DUTY_CYCLE = 60;
+
+	// Time that solenoid is powered when firing, in ms
+	uint16_t solenoidOnTime = 35;
+
+	// Time that solenoid is off when firing, in ms
+	uint16_t solenoidOffTime = 15;
+
+	// Timer to keep track of when to turn on/off the pusher
+	Timer<> firingTimer = timer_create_default();
+
+  Button btnPusher = Button(PIN_IN_PUSHER, 50, true, true);
+  Button btnFlywheel = Button(PIN_IN_FLYWHEEL, 50, true, true);
+  Button btnFireMode = Button(PIN_IN_FIREMODE, 50, true, true);
+
+} firingState;
+
+void LogMessage(const char* s) {
+  Serial.println(s);
+}
+
+
+void updateSolenoidTiming();
+
+void cycleFeedOn();
+bool cycleFeedOff(void *);
+void cycleFeedBegin();
+bool cycleFeedComplete(void *);
+bool handleFeedTransition(void *);
+
+void cyclePusherOn();
+bool cyclePusherOff(void *);
+void cyclePusherBegin();
+bool cyclePusherComplete(void *);
+bool handlePusherTransition(void *);
+
+void handlePusherSemiAutoAndBurst();
+void handlePusherFullAuto();
+
+void handleFiring();
+void controlMotors();
+void setRateOfFire();
+void setDartsToFire();
+
+
+void controlMotors() {
+  //LogMessage("controlMotors");
+	// If too much current, cut off power to load and don't run anything else
+/*
+  if (currentSenseState.isTooMuchCurrent) {
+    if (millis() % 5000 == 0)
+  		Serial.println("OCP");
+
+		turnOffAllFETs();
+
+		firingState.targetPusherState = PUSHER_DRIVE_STATE_OFF;
+    firingState.isPusherFiring = false;
+
+		return;
+	}
+  */
+  if ((firingState.currentFeedState != FEED_STATE_READY) || (firingState.currentFeedState != firingState.targetFeedState)) {
+    if (firingState.currentFeedState == FEED_STATE_NEEDED && !firingState.changingFeedState) {
+      firingState.changingFeedState = true;
+      firingState.targetFeedState = FEED_STATE_ON;
+      firingState.firingTimer.in(1, handleFeedTransition);
+    }
+  }	else if (firingState.targetPusherState == PUSHER_DRIVE_STATE_OFF) {
+    //turnOffAllFETs();
+
+    firingState.currentPusherState = PUSHER_DRIVE_STATE_OFF;
+
+  // Targetstate requires MOSFETs to change state that's at risk of shoot-
+  // through
+  // When transition FETs where the FETs are complementary, here's the sequence:
+	// BRAKE -> OFF -> [shoot-through delay] -> ON
+	// (or)
+	// ON -> OFF -> [shoot-through delay] -> BRAKE
+  					// Nake sure pusher state changed
+  } else if (firingState.currentPusherState != firingState.targetPusherState
+    && !firingState.changingPusherState
+  	// Make sure target pusher state results in a complementary FET state
+  	&& (firingState.targetPusherState == PUSHER_DRIVE_STATE_ON
+  	|| firingState.targetPusherState == PUSHER_DRIVE_STATE_BRAKE)) {
+      firingState.changingPusherState = true;
+   	//turnOffAllFETs();
+
+   	// Set flag to indicate that transition of FETs to a complementary state has
+   	// begun
+   	//fetState.hasComplementaryTransitionBegun = true;
+
+   	// Transition FETs to match their target state afte SHOOT_THROUGH_DELAY
+     firingState.firingTimer
+   		.in(1, handlePusherTransition);
+  }
+}
+bool handleFeedTransition(void *) {
+  LogMessage("handleFeedTransition");
+	if (firingState.targetFeedState == FEED_STATE_NEEDED) {
+		digitalWrite(PIN_OUT_PUSHER, HIGH);
+	} else if (firingState.targetPusherState == PUSHER_DRIVE_STATE_BRAKE) {
+		digitalWrite(PIN_OUT_PUSHER, LOW);
+	}
+
+	// Reset flag, complementary transition complete
+ 	firingState.changingFeedState = false;
+
+ 	// Target pusher state has been achieved
+	firingState.currentFeedState = firingState.targetFeedState;
+
+	return true;		//required by timer lib
+}
+
+bool handlePusherTransition(void *) {
+  LogMessage("handlePusherTransition");
+	if (firingState.targetPusherState == PUSHER_DRIVE_STATE_ON) {
+		digitalWrite(PIN_OUT_PUSHER, HIGH);
+	} else if (firingState.targetPusherState == PUSHER_DRIVE_STATE_BRAKE) {
+		digitalWrite(PIN_OUT_PUSHER, LOW);
+	}
+
+	// Reset flag, complementary transition complete
+ 	firingState.changingPusherState = false;
+
+ 	// Target pusher state has been achieved
+	firingState.currentPusherState = firingState.targetPusherState;
+
+	return true;		//required by timer lib
+}
+
+void handleFiring() {
+  //LogMessage("handleFiring");
+  if (firingState.currentFeedState == FEED_STATE_READY) {
+  	if (firingState.btnPusher.wasPressed()) {
+      setRateOfFire();
+      setDartsToFire();
+      firingState.isPusherFiring = true;
+    }
+    if (firingState.isPusherFiring) {
+    	cyclePusherBegin();
+    }
+  } else {
+    if (!firingState.isPusherFiring)
+      cycleFeedBegin();
+  }
+}
+void setRateOfFire() {
+  LogMessage("setRateOfFire");
+	uint8_t lowerLimitForRateOfFire = 1;
+	uint8_t upperLimitForRateOfFire = 100;
+
+	if (firingState.pusherMechanism == SOLENOID_FIRING_MECHANISM) {
+		lowerLimitForRateOfFire = 20;
+		upperLimitForRateOfFire = 35;
+	}
+  long MULTIPLIER = 1024;
+	firingState.rateOfFire = map(
+		MULTIPLIER, 0, 1024,
+		upperLimitForRateOfFire, lowerLimitForRateOfFire);
+
+	Serial.println(firingState.rateOfFire);
+}
+
+void setDartsToFire() {
+  LogMessage("setDartsToFire");
+  if (firingState.currentFireMode == SEMI_AUTO) {
+    firingState.dartsToFire = 1;
+  } else if (firingState.currentFireMode == BURST_FIRE) {
+    firingState.dartsToFire = BURST_FIRE_LENGTH;
+  }
+
+  firingState.dartsFired = 0;
+}
+void cyclePusherBegin() {
+  LogMessage("cyclePusherBegin");
+	// Right when trigger was pulled, initiate firing sequence
+  if (firingState.btnPusher.wasPressed()) {
+		// Set solenoid on and off times based on rate of fire
+		updateSolenoidTiming();
+
+		// Turn solenoid on, set it to turn off later. Solenoid shouldn't be
+		// turned on in safety
+		if (firingState.currentFireMode != SAFETY) {
+			firingState.targetPusherState = PUSHER_DRIVE_STATE_ON;
+			firingState.firingTimer
+				.in(firingState.solenoidOnTime, cyclePusherOff);
+
+		// Firemode is safety
+		} else {
+			firingState.targetPusherState = PUSHER_DRIVE_STATE_BRAKE;
+			firingState.isPusherFiring = false;
+		}
+	}
+
+}
+
+void cycleFeedBegin() {
+  LogMessage("cycleFeedBegin");
+	// Right when trigger was pulled, initiate firing sequence
+  if (firingState.currentFeedState != FEED_STATE_READY) {
+		// Set solenoid on and off times based on rate of fire
+		updateSolenoidTiming();
+
+		// Turn solenoid on, set it to turn off later. Solenoid shouldn't be
+		// turned on in safety
+		firingState.targetFeedState = FEED_STATE_ON;
+		firingState.firingTimer
+				.in(firingState.solenoidOnTime, cycleFeedOff);
+	}
+
+}
+// Turns solenoid off and continues firing loop. Don't call this if you just
+// want to turn off the solenoid
+bool cycleFeedOff(void *) {
+  LogMessage("cycleFeedOff");
+	// Serial.println("Off");
+	firingState.targetFeedState = FEED_STATE_READY;
+
+	firingState.firingTimer
+		.in(firingState.solenoidOffTime, cycleFeedComplete);
+  return true;
+}
+bool cycleFeedComplete(void *) {
+  LogMessage("cycleFeedComplete");
+  if (firingState.btnPusher.isPressed()) {
+    if (firingState.currentFireMode == SEMI_AUTO
+      || firingState.currentFireMode == BURST_FIRE) {
+      handlePusherSemiAutoAndBurst();
+    } else if (firingState.currentFireMode == FULL_AUTO) {
+      handlePusherFullAuto();
+    } else {
+      firingState.targetPusherState = PUSHER_DRIVE_STATE_BRAKE;
+    }
+  }
+  return true;
+
+}
+
+// Sets solenoid timing based on rate of fire and duty cycle
+void updateSolenoidTiming() {
+  LogMessage("updateSolenoidTiming");
+	//setRateOfFire();
+
+	firingState.solenoidOnTime = (100.0 / firingState.rateOfFire)
+		* (firingState.SOLENOID_DUTY_CYCLE / 2.0);
+
+	firingState.solenoidOffTime = firingState.solenoidOnTime
+		/ (firingState.SOLENOID_DUTY_CYCLE/(100.0/2.0));
+
+	// Serial.print("On time "); Serial.println(firingState.solenoidOnTime);
+	// Serial.print("Off time "); Serial.println(firingState.solenoidOffTime);
+}
+
+void handlePusherSemiAutoAndBurst() {
+  LogMessage("handlePusherSemiAutoAndBurst");
+  // If no more darts to fire, stop solenoid
+  if (firingState.dartsFired >= firingState.dartsToFire) {
+    firingState.targetPusherState = PUSHER_DRIVE_STATE_BRAKE;
+    firingState.dartsFired = 0;
+    firingState.isPusherFiring = false;
+
+  // Still more darts to fire, so keep firing pusher and continue firing loop
+  } else {
+  	cyclePusherOn();
+  }
+}
+
+void handlePusherFullAuto() {
+  LogMessage("handlePusherFullAuto");
+	// Trigger is let go, so turn off solenoid
+  if (!firingState.btnPusher.isPressed()) {
+    firingState.targetPusherState = PUSHER_DRIVE_STATE_BRAKE;
+    firingState.isPusherFiring = false;
+
+  // Trigger still pressed, so keep firing pusher and continue firing loop
+  } else {
+  	cyclePusherOn();
+  }
+}
+
+// Turns solenoid off and continues firing loop. Don't call this if you just
+// want to turn off the solenoid
+bool cyclePusherOff(void *) {
+  LogMessage("cyclePusherOff");
+	// Serial.println("Off");
+	firingState.targetPusherState = PUSHER_DRIVE_STATE_BRAKE;
+
+	firingState.firingTimer
+		.in(firingState.solenoidOffTime, cyclePusherComplete);
+  return true;
+}
+
+// Called after solenoid turns off and about to turn back on. Ideally, this is
+// executed when plunger in retraced position. Determines whether to continue
+// firing the solenoid or to turn the solenoid off
+bool cyclePusherComplete(void *) {
+  LogMessage("cyclePusherComplete");
+	firingState.dartsFired++;
+  firingState.currentFeedState = FEED_STATE_NEEDED;
+  firingState.targetFeedState = FEED_STATE_READY;
+	// Update timing in case rate of fire changed
+	updateSolenoidTiming();
+
+  return true;
+}
+
+// Turns solenoid on and continues firing loop. Don't call this if you just
+// want to turn on the solenoid
+void cyclePusherOn() {
+  LogMessage("cyclePusherOn");
+	// Serial.println("On");
+	firingState.targetPusherState = PUSHER_DRIVE_STATE_ON;
+
+	firingState.firingTimer
+ 		.in(firingState.solenoidOffTime, cyclePusherOff);
+}
+
+void initButtons() {
+  firingState.btnPusher.begin();
+  firingState.btnFlywheel.begin();
+  firingState.btnFireMode.begin();
+}
+void updateButtons() {
+  firingState.btnPusher.read();
+  firingState.btnFlywheel.read();
+  firingState.btnFireMode.read();
+}
+// End suild stuff
+// Begin Code
 void setup()   /*----( SETUP: RUNS ONCE )----*/
 {
   initSerial();
   initPins();
+  initButtons();
   initDisplay();
   initBattery();
 }
@@ -219,7 +611,7 @@ void drawFireModeAuto() {
   }
 }
 void drawFireMode() {
-    switch (fireModeCurrent) {
+    switch (firingState.currentFireMode) {
     case 0: //SAFE
       drawFireModeSafe();
       break;
@@ -290,7 +682,7 @@ void oldShit() {
   //lcd.clear();
   //Fire Mode
   lcd.setCursor(0, 0);
-  lcd.print(fireModeName[fireModeCurrent]);
+  lcd.print(fireModeName[firingState.currentFireMode]);
   lcd.print("  ");
   lcd.print(burstRemaining);
 
@@ -331,7 +723,7 @@ void oldShit() {
 
 int updateFireMode(int newFireMode=-1) {
   if (newFireMode != -1)
-    fireModeCurrent = newFireMode;
+    firingState.currentFireMode = newFireMode;
 
   readingFireMode = digitalRead(PIN_IN_FIREMODE);
   if (millis() - timeFireMode > debounce) {
@@ -341,17 +733,17 @@ int updateFireMode(int newFireMode=-1) {
       lockedFireMode=0;
     } else {
       if (!lockedFireMode) {
-        if (fireModeCurrent == 3)
-          fireModeCurrent = 0;
+        if (firingState.currentFireMode == 3)
+          firingState.currentFireMode = 0;
         else
-          fireModeCurrent++;
+          firingState.currentFireMode++;
         lockedFireMode=1;
       }
       stateFireMode = HIGH;
     }
   }
   previousFireMode = readingFireMode;
-  return fireModeCurrent;
+  return firingState.currentFireMode;
 }
 
 void updatePusher() {
@@ -433,7 +825,7 @@ void doFeedAdvance() {
 
 // Attempt to fire a dart
 void checkFireDart() {
-  switch (fireModeCurrent) {
+  switch (firingState.currentFireMode) {
     case 0: //SAFE
       return;
       break;
@@ -470,7 +862,7 @@ void checkRev() {
 
 // Check conditions to see if we need to fire a dart
 void checkFireControl() {
-  if (!fireModeCurrent)
+  if (!firingState.currentFireMode)
     return;
   if (stateRev) {
     checkRev();
@@ -483,6 +875,11 @@ void checkFireControl() {
 // Main loop
 void loop()
 {
+  firingState.firingTimer.tick();
+  updateButtons();
+  handleFiring();
+ 	controlMotors();
+
   updateRev();
   updatePusher();
   updateFireMode();
